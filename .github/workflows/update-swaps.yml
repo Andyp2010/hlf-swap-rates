@@ -1,0 +1,46 @@
+name: Update RBNZ Daily Swap Rates
+
+on:
+  schedule:
+    # Primary check: Tue-Sat at 10:45 AM NZDT / 9:45 AM NZST (21:45 UTC Mon-Fri)
+    - cron: "45 21 * * 1-5"
+    # Backup check 90 mins later: 12:15 PM NZDT / 11:15 AM NZST
+    - cron: "15 23 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-swaps:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.REPO_PAT || github.token }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python packages & Headless Chromium
+        run: |
+          pip install pandas openpyxl playwright
+          playwright install --with-deps chromium
+
+      - name: Fetch RBNZ Table B2 & build JSON + Static HTML
+        run: python update_swaps.py
+
+      - name: Commit & push updated JSON and Static HTML
+        run: |
+          git config user.name "hlf-rates-bot"
+          git config user.email "bot@homeloanfactory.co.nz"
+          if [[ -n $(git status --porcelain nz-swap-rates.json index.html) ]]; then
+            git add nz-swap-rates.json index.html
+            git commit -m "Auto-update RBNZ B2 swap rates & static table ($(date -u +'%Y-%m-%d'))"
+            git push
+          else
+            echo "No new RBNZ trading day to commit."
+          fi
