@@ -1,46 +1,44 @@
-name: Update RBNZ Daily Swap Rates
+name: Update NZ Wholesale Swap Rates
 
 on:
-  schedule:
-    # Primary check: Tue-Sat at 10:45 AM NZDT / 9:45 AM NZST (21:45 UTC Mon-Fri)
-    - cron: "45 21 * * 1-5"
-    # Backup check 90 mins later: 12:15 PM NZDT / 11:15 AM NZST
-    - cron: "15 23 * * 1-5"
   workflow_dispatch:
+  schedule:
+    # Run 1: 22:23 UTC = 11:23 AM NZDT / 10:23 AM Fiji (catches morning RBNZ upload)
+    - cron: '23 22 * * *'
+    # Run 2: 02:37 UTC = 3:37 PM NZDT / 2:37 PM Fiji (catches 3:00 PM RBNZ release window)
+    - cron: '37 2 * * *'
 
 permissions:
   contents: write
 
 jobs:
-  update-swaps:
+  update-rates:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.REPO_PAT || github.token }}
 
-      - name: Set up Python 3.12
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.11'
 
-      - name: Install Python packages & Headless Chromium
+      - name: Install dependencies
         run: |
-          pip install pandas openpyxl playwright
-          playwright install --with-deps chromium
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install pandas openpyxl requests; fi
 
-      - name: Fetch RBNZ Table B2 & build JSON + Static HTML
+      - name: Fetch RBNZ Table B2 & rebuild outputs
         run: python update_swaps.py
 
-      - name: Commit & push updated JSON and Static HTML
+      - name: Commit and push updated data
         run: |
-          git config user.name "hlf-rates-bot"
-          git config user.email "bot@homeloanfactory.co.nz"
-          if [[ -n $(git status --porcelain nz-swap-rates.json index.html) ]]; then
-            git add nz-swap-rates.json index.html
-            git commit -m "Auto-update RBNZ B2 swap rates & static table ($(date -u +'%Y-%m-%d'))"
-            git push
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No file changes to commit."
           else
-            echo "No new RBNZ trading day to commit."
+            git commit -m "Auto-update RBNZ Table B2 swap rates ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+            git pull --rebase origin main
+            git push origin HEAD:main
           fi
