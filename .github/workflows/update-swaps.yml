@@ -2,12 +2,16 @@ name: Update NZ Wholesale Swap Rates
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '*.xlsx'
   schedule:
     # 02:23 UTC = 2:23 PM Fiji / 3:23 PM NZDT (catches 3:00 PM NZDT RBNZ release)
     - cron: '23 2 * * *'
     # 03:37 UTC = 3:37 PM Fiji / 4:37 PM NZDT / 3:37 PM NZST winter
     - cron: '37 3 * * *'
-    # 06:47 UTC = 6:47 PM Fiji / 7:47 PM NZDT (evening backup — will also auto-fire tonight)
+    # 06:47 UTC = 6:47 PM Fiji / 7:47 PM NZDT (evening backup)
     - cron: '47 6 * * *'
 
 permissions:
@@ -25,20 +29,21 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Python packages & Playwright Chromium
+      - name: Install anti-detect browsers & virtual display
         run: |
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install pandas openpyxl requests playwright
-          python -m playwright install --with-deps chromium
+          sudo apt-get update && sudo apt-get install -y xvfb libgtk-3-0 libasound2t64 libx11-xcb1 || sudo apt-get install -y xvfb
+          pip install pandas openpyxl requests curl_cffi "camoufox[geoip]" playwright
+          python -m camoufox fetch
+          python -m playwright install chromium
 
       - name: Fetch RBNZ Table B2 & rebuild outputs
-        run: python update_swaps.py
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python update_swaps.py
 
       - name: Commit and push updated data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
+          git add nz-swap-rates.json index.html
           if git diff --staged --quiet; then
             echo "No file changes to commit."
           else
