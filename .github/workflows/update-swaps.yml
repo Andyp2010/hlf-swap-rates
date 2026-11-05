@@ -3,12 +3,12 @@ name: Update NZ Wholesale Swap Rates
 on:
   workflow_dispatch:
   schedule:
-    # 1) 02:23 UTC = 3:23 PM NZDT (2:23 PM Fiji) — catches 3:00 PM RBNZ release during NZ Daylight Saving
+    # 02:23 UTC = 2:23 PM Fiji / 3:23 PM NZDT (catches 3:00 PM NZDT RBNZ release)
     - cron: '23 2 * * *'
-    # 2) 03:37 UTC = 3:37 PM NZST / 4:37 PM NZDT (3:37 PM Fiji) — catches winter 3:00 PM release + late uploads
+    # 03:37 UTC = 3:37 PM Fiji / 4:37 PM NZDT / 3:37 PM NZST winter
     - cron: '37 3 * * *'
-    # 3) 05:17 UTC = 6:17 PM NZDT (5:17 PM Fiji) — evening backup safety net
-    - cron: '17 5 * * *'
+    # 06:47 UTC = 6:47 PM Fiji / 7:47 PM NZDT (evening backup — will also auto-fire tonight)
+    - cron: '47 6 * * *'
 
 permissions:
   contents: write
@@ -25,9 +25,11 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install Python packages & Playwright Chromium
         run: |
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install pandas openpyxl requests; fi
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pandas openpyxl requests playwright
+          python -m playwright install --with-deps chromium
 
       - name: Fetch RBNZ Table B2 & rebuild outputs
         run: python update_swaps.py
