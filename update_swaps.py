@@ -1,8 +1,11 @@
+import base64
 import datetime
 import glob
 import json
 import os
 import pathlib
+import re
+import time
 import pandas as pd
 
 RBNZ_PAGE = "https://www.rbnz.govt.nz/statistics/series/exchange-and-interest-rates/wholesale-interest-rates"
@@ -26,7 +29,98 @@ SERIES_MAP = {
 }
 
 
-def fetch_xlsx_from_page(page, context, match_fn, fallback_url: str, dest_path: str) -> bool:
+def is_valid_xlsx(data: bytes) -> bool:
+    return bool(data and len(data) > 10000 and data[:4] == b"PK\x03\x04")
+
+
+def add_cache_buster(url: str) -> str:
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}_cb={int(time.time())}"
+
+
+def try_curl_cffi_download(need_historical: bool, curr_dest: str, hist_dest: str) -> bool:
+    """Tier 1: Chrome TLS (JA3/JA4) + HTTP/2 impersonation via curl_cffi."""
+    try:
+        from curl_cffi import requests as cf_requests
+    except ImportError:
+        print("[Tier 1 - curl_cffi] Package not installed; skipping.")
+        return False
+
+    print("[Tier 1 - curl_cffi] Attempting Chrome TLS impersonation fetch...")
+    try:
+        session = cf_requests.Session(impersonate="chrome")
+        headers = {
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Referer": RBNZ_PAGE,
+        }
+        curr_url, hist_url = CURR_FALLBACK, HIST_FALLBACK
+
+        page_resp = session.get(add_cache_buster(RBNZ_PAGE), headers=headers, timeout=30)
+        print(f"[Tier 1 - curl_cffi] RBNZ page HTTP {page_resp.status_code} ({len(page_resp.content):,} bytes)")
+        if page_resp.status_code == 200:
+            for href in re.findall(r'href=["\']([^"\']*\.xlsx[^"\']*)["\']', page_resp.text, flags=re.I):
+                full = "https://www.rbnz.govt.nz" + href if href.startswith("/") else href
+                low = full.lower()
+                if "hb2-daily-close" in low and "1985" not in low:
+                    curr_url = full
+                elif "1985-2017" in low:
+                    hist_url = full
+
+        r_curr = session.get(
+            add_cache_buster(curr_url),
+            headers={**headers, "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*"},
+            timeout=45,
+        )
+        print(f"[Tier 1 - curl_cffi] Current XLSX HTTP {r_curr.status_code} ({len(r_curr.content):,} bytes)")
+        if not is_valid_xlsx(r_curr.content):
+            snippet = r_curr.content[:160].decode("utf-8", errors="replace").replace("\n", " ")
+            print(f"[Tier 1 - curl_cffi] Non-XLSX payload: {snippet}")
+            return False
+
+        pathlib.Path(curr_dest).write_bytes(r_curr.content)
+        if need_historical:
+            r_hist = session.get(add_cache_buster(hist_url), headers=headers, timeout=45)
+            if not is_valid_xlsx(r_hist.content):
+                return False
+            pathlib.Path(hist_dest).write_bytes(r_hist.content)
+
+        print("[Tier 1 - curl_cffi] Downloaded valid RBNZ XLSX.")
+        return True
+    except Exception as exc:
+        print(f"[Tier 1 - curl_cffi] Error: {exc}")
+        return False
+
+
+def wait_for_cloudflare_clear(page, label: str, max_wait_sec: int = 35) -> None:
+    """Poll until Cloudflare challenge clears and .xlsx links render in the DOM."""
+    start = time.time()
+    clicked_turnstile = False
+    while time.time() - start < max_wait_sec:
+        try:
+            title = (page.title() or "").strip()
+            xlsx_count = page.locator('a[href*=".xlsx"]').count()
+            if xlsx_count > 0 and "just a moment" not in title.lower():
+                print(f"[{label}] Page ready: title='{title}' | .xlsx links={xlsx_count}")
+                return
+            print(f"[{label}] Waiting ({int(time.time() - start)}s)... title='{title}' | .xlsx links={xlsx_count}")
+
+            if not clicked_turnstile and (time.time() - start) > 8:
+                for frame in page.frames:
+                    if "challenges.cloudflare.com" in (frame.url or ""):
+                        box = frame.locator("body").bounding_box()
+                        if box:
+                            page.mouse.click(box["x"] + 28, box["y"] + box["height"] / 2)
+                            clicked_turnstile = True
+                            print(f"[{label}] Clicked Cloudflare Turnstile checkbox.")
+                            break
+        except Exception as exc:
+            print(f"[{label}] Poll note: {exc}")
+        page.wait_for_timeout(2500)
+
+
+def fetch_xlsx_in_browser(page, match_fn, fallback_url: str, dest_path: str, label: str) -> bool:
+    """Download XLSX using the browser's own network/TLS stack and cf_clearance cookies."""
     target_url = fallback_url
     matched_locator = None
 
@@ -37,64 +131,130 @@ def fetch_xlsx_from_page(page, context, match_fn, fallback_url: str, dest_path: 
             matched_locator = link
             break
 
+    bust_url = add_cache_buster(target_url)
+    print(f"[{label}] In-browser fetch: {bust_url}")
+
     try:
-        resp = context.request.get(target_url, timeout=60000)
-        body = resp.body()
-        if resp.ok and len(body) > 4000 and body[:2] == b"PK":
-            pathlib.Path(dest_path).write_bytes(body)
-            return True
+        res = page.evaluate(
+            """async (url) => {
+                const r = await fetch(url, { cache: 'no-store', credentials: 'include' });
+                if (!r.ok) return { ok: false, status: r.status, b64: '' };
+                const bytes = new Uint8Array(await r.arrayBuffer());
+                let bin = '';
+                for (let i = 0; i < bytes.length; i += 0x8000) {
+                    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+                }
+                return { ok: true, status: r.status, b64: btoa(bin) };
+            }""",
+            bust_url,
+        )
+        if res and res.get("ok") and res.get("b64"):
+            raw = base64.b64decode(res["b64"])
+            print(f"[{label}] In-browser fetch HTTP {res.get('status')} ({len(raw):,} bytes)")
+            if is_valid_xlsx(raw):
+                pathlib.Path(dest_path).write_bytes(raw)
+                return True
+        else:
+            print(f"[{label}] In-browser fetch returned status={res.get('status') if res else 'None'}")
     except Exception as exc:
-        print(f"Direct context fetch note: {exc}")
+        print(f"[{label}] In-browser fetch note: {exc}")
 
     if matched_locator is not None:
         try:
-            with page.expect_download(timeout=60000) as dl_info:
+            with page.expect_download(timeout=45000) as dl_info:
                 matched_locator.click(force=True)
             dl_info.value.save_as(dest_path)
-            if pathlib.Path(dest_path).read_bytes()[:2] == b"PK":
+            raw = pathlib.Path(dest_path).read_bytes()
+            print(f"[{label}] Click download saved ({len(raw):,} bytes)")
+            if is_valid_xlsx(raw):
                 return True
         except Exception as exc:
-            print(f"Browser click download note: {exc}")
+            print(f"[{label}] Click download note: {exc}")
 
     return False
 
 
-def download_rbnz_files(need_historical: bool, curr_dest: str, hist_dest: str) -> bool:
-    from playwright.sync_api import sync_playwright
+def try_camoufox_download(need_historical: bool, curr_dest: str, hist_dest: str) -> bool:
+    """Tier 2: Anti-detect Camoufox browser under Xvfb (zero CDP leak)."""
+    try:
+        from camoufox.sync_api import Camoufox
+    except ImportError:
+        print("[Tier 2 - Camoufox] Package not installed; skipping.")
+        return False
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        context = browser.new_context(
-            accept_downloads=True,
-            viewport={"width": 1366, "height": 900},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        )
-        page = context.new_page()
-        page.goto(RBNZ_PAGE, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(5000)
+    print("[Tier 2 - Camoufox] Launching anti-detect browser...")
+    try:
+        with Camoufox(headless=False, humanize=True) as browser:
+            page = browser.new_page()
+            page.goto(add_cache_buster(RBNZ_PAGE), wait_until="domcontentloaded", timeout=60000)
+            wait_for_cloudflare_clear(page, "Tier 2 - Camoufox", max_wait_sec=35)
 
-        ok_curr = fetch_xlsx_from_page(
-            page,
-            context,
-            lambda h: "hb2-daily-close" in h and "1985" not in h,
-            CURR_FALLBACK,
-            curr_dest,
-        )
-        ok_hist = True
-        if need_historical:
-            ok_hist = fetch_xlsx_from_page(
-                page,
-                context,
-                lambda h: "1985-2017" in h,
-                HIST_FALLBACK,
-                hist_dest,
+            ok_curr = fetch_xlsx_in_browser(
+                page, lambda h: "hb2-daily-close" in h and "1985" not in h, CURR_FALLBACK, curr_dest, "Tier 2 - Camoufox"
             )
+            ok_hist = True
+            if need_historical and ok_curr:
+                ok_hist = fetch_xlsx_in_browser(
+                    page, lambda h: "1985-2017" in h, HIST_FALLBACK, hist_dest, "Tier 2 - Camoufox"
+                )
+            return ok_curr and ok_hist
+    except Exception as exc:
+        print(f"[Tier 2 - Camoufox] Error: {exc}")
+        return False
 
-        browser.close()
-        return ok_curr and ok_hist
+
+def try_headed_chrome_download(need_historical: bool, curr_dest: str, hist_dest: str) -> bool:
+    """Tier 3: Headed Google Chrome under Xvfb with native OS fingerprint (no fake UA mismatch)."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("[Tier 3 - Chrome] Playwright not installed; skipping.")
+        return False
+
+    print("[Tier 3 - Chrome] Launching headed Chrome...")
+    profile_dir = pathlib.Path("/tmp/hlf_chrome_profile")
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with sync_playwright() as p:
+            kw = dict(
+                user_data_dir=str(profile_dir),
+                headless=False,
+                accept_downloads=True,
+                viewport={"width": 1366, "height": 900},
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            )
+            try:
+                context = p.chromium.launch_persistent_context(channel="chrome", **kw)
+            except Exception:
+                context = p.chromium.launch_persistent_context(**kw)
+
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(add_cache_buster(RBNZ_PAGE), wait_until="domcontentloaded", timeout=60000)
+            wait_for_cloudflare_clear(page, "Tier 3 - Chrome", max_wait_sec=35)
+
+            ok_curr = fetch_xlsx_in_browser(
+                page, lambda h: "hb2-daily-close" in h and "1985" not in h, CURR_FALLBACK, curr_dest, "Tier 3 - Chrome"
+            )
+            ok_hist = True
+            if need_historical and ok_curr:
+                ok_hist = fetch_xlsx_in_browser(
+                    page, lambda h: "1985-2017" in h, HIST_FALLBACK, hist_dest, "Tier 3 - Chrome"
+                )
+            context.close()
+            return ok_curr and ok_hist
+    except Exception as exc:
+        print(f"[Tier 3 - Chrome] Error: {exc}")
+        return False
+
+
+def download_rbnz_files(need_historical: bool, curr_dest: str, hist_dest: str) -> bool:
+    if try_curl_cffi_download(need_historical, curr_dest, hist_dest):
+        return True
+    if try_camoufox_download(need_historical, curr_dest, hist_dest):
+        return True
+    if try_headed_chrome_download(need_historical, curr_dest, hist_dest):
+        return True
+    return False
 
 
 def load_existing_json(json_path: pathlib.Path) -> pd.DataFrame:
@@ -229,7 +389,7 @@ def build_static_html(swaps: pd.DataFrame, latest_str: str, now_utc: str) -> str
 <body>
   <main>
     <h1>New Zealand Wholesale Swap Rates — Daily Reference Tables</h1>
-    <p>Machine-readable static HTML tables updated automatically each New Zealand business morning from <a href="https://www.rbnz.govt.nz/statistics/series/exchange-and-interest-rates/wholesale-interest-rates">Reserve Bank of New Zealand (RBNZ) Table B2</a> (sourced via RBNZ, Reuters, and NZFMA; 1-business-day delayed end-of-day closing mid-rates). Latest RBNZ close: <strong>{latest_str}</strong> (Checked: <code>{now_utc}</code>).</p>
+    <p>Machine-readable static HTML tables updated automatically each New Zealand business day from <a href="https://www.rbnz.govt.nz/statistics/series/exchange-and-interest-rates/wholesale-interest-rates">Reserve Bank of New Zealand (RBNZ) Table B2</a> (sourced via RBNZ, Reuters, and NZFMA; 1-business-day delayed end-of-day closing mid-rates). Latest RBNZ close: <strong>{latest_str}</strong> (Checked: <code>{now_utc}</code>).</p>
     <div>
       <a class="cta" href="https://www.homeloanfactory.co.nz/tools/nz-wholesale-swap-rates">&larr; Open Interactive Swap Rates Chart</a>
       <a class="cta cta-sec" href="https://www.homeloanfactory.co.nz/tools/compare-nz-mortgage-rates">Compare Retail NZ Mortgage Rates</a>
@@ -285,25 +445,40 @@ def main() -> None:
         frames.append(existing_df)
         need_hist = False
     else:
-        local_xlsx = sorted(glob.glob(str(root / "*.xlsx")))
-        for lf in local_xlsx:
-            if not os.path.basename(lf).startswith("tmp_"):
-                frames.append(parse_rbnz_excel(lf))
-        need_hist = not any("1985" in os.path.basename(lf) for lf in local_xlsx)
+        need_hist = True
+
+    # Always ingest any manually uploaded .xlsx files in repo root as well
+    local_xlsx = sorted(glob.glob(str(root / "*.xlsx")))
+    local_newer = False
+    for lf in local_xlsx:
+        if not os.path.basename(lf).startswith("tmp_"):
+            ldf = parse_rbnz_excel(lf)
+            lmax = ldf["date"].max().strftime("%Y-%m-%d")
+            print(f"Loaded repo XLSX '{os.path.basename(lf)}' (latest={lmax}, rows={len(ldf)})")
+            if lmax > old_latest:
+                local_newer = True
+            frames.append(ldf)
+            if "1985" in os.path.basename(lf):
+                need_hist = False
 
     try:
         fetched_ok = download_rbnz_files(need_hist, str(tmp_curr), str(tmp_hist))
     except Exception as exc:
-        print(f"RBNZ browser fetch warning: {exc}")
+        print(f"RBNZ live fetch exception: {exc}")
         fetched_ok = False
-
-    if not fetched_ok and (json_path.exists() or frames):
-        print("Live RBNZ download skipped or unavailable; proceeding with stored/seed data.")
 
     for tmp_file in (tmp_hist, tmp_curr):
         if tmp_file.exists():
-            frames.append(parse_rbnz_excel(str(tmp_file)))
+            tdf = parse_rbnz_excel(str(tmp_file))
+            print(f"Parsed live RBNZ '{tmp_file.name}': latest trading date = {tdf['date'].max().strftime('%Y-%m-%d')} ({len(tdf)} rows)")
+            frames.append(tdf)
             os.remove(tmp_file)
+
+    if not fetched_ok and not local_newer:
+        raise RuntimeError(
+            "All 3 live RBNZ download tiers were blocked by Cloudflare (and no newer .xlsx was uploaded to the repo). "
+            "Failing workflow so GitHub Actions reports the block honestly instead of faking a green run."
+        )
 
     if not frames:
         raise RuntimeError("No RBNZ data sources found to build nz-swap-rates.json.")
@@ -316,11 +491,8 @@ def main() -> None:
         raise RuntimeError(f"Unexpectedly low row count ({len(swaps)}); aborting overwrite.")
 
     latest_str = swaps["date"].iloc[-1].strftime("%Y-%m-%d")
-    if latest_str == old_latest and len(swaps) == old_count and html_path.exists():
-        print(f"Already up to date through {old_latest} ({old_count} rows).")
-        return
-
     now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     payload = {
         "source": "Reserve Bank of New Zealand (Table B2), Reuters, NZFMA",
         "latest_date": latest_str,
@@ -334,7 +506,7 @@ def main() -> None:
 
     json_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
     html_path.write_text(build_static_html(swaps, latest_str, now_utc), encoding="utf-8")
-    print(f"Saved nz-swap-rates.json and index.html through {latest_str} ({len(swaps)} rows).")
+    print(f"Saved nz-swap-rates.json and index.html through {latest_str} ({len(swaps)} rows, checked {now_utc}).")
 
 
 if __name__ == "__main__":
