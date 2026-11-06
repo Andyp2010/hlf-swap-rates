@@ -491,6 +491,10 @@ def main() -> None:
         raise RuntimeError(f"Unexpectedly low row count ({len(swaps)}); aborting overwrite.")
 
     latest_str = swaps["date"].iloc[-1].strftime("%Y-%m-%d")
+    if latest_str == old_latest and len(swaps) == old_count and html_path.exists():
+        print(f"Live RBNZ verified; already up to date through {latest_str} ({old_count} rows).")
+        return
+
     now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     payload = {
