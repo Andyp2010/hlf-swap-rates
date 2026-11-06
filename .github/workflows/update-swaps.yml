@@ -6,13 +6,17 @@ on:
     branches: [main]
     paths:
       - '*.xlsx'
-  schedule:
-    # 02:23 UTC = 2:23 PM Fiji / 3:23 PM NZDT (catches 3:00 PM NZDT RBNZ release)
-    - cron: '23 2 * * *'
-    # 03:37 UTC = 3:37 PM Fiji / 4:37 PM NZDT / 3:37 PM NZST winter
-    - cron: '37 3 * * *'
-    # 06:47 UTC = 6:47 PM Fiji / 7:47 PM NZDT (evening backup)
-    - cron: '47 6 * * *'
+schedule:
+    # 1) 02:14 UTC = 3:14 PM NZDT (2:14 PM Fiji) — catches 3:00 PM summer release fast
+    - cron: '14 2 * * 1-5'
+    # 2) 02:42 UTC = 3:42 PM NZDT (2:42 PM Fiji) — catches slightly late summer uploads
+    - cron: '42 2 * * 1-5'
+    # 3) 03:18 UTC = 4:18 PM NZDT / 3:18 PM NZST & Fiji — catches winter 3:00 PM release
+    - cron: '18 3 * * 1-5'
+    # 4) 04:23 UTC = 5:23 PM NZDT / 4:23 PM NZST & Fiji — close-of-business backup
+    - cron: '23 4 * * 1-5'
+    # 5) 07:17 UTC = 8:17 PM NZDT / 7:17 PM NZST & Fiji — evening safety net
+    - cron: '17 7 * * 1-5'
 
 permissions:
   contents: write
