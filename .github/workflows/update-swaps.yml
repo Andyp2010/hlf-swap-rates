@@ -6,7 +6,7 @@ on:
     branches: [main]
     paths:
       - '*.xlsx'
-schedule:
+  schedule:
     # 1) 02:14 UTC = 3:14 PM NZDT (2:14 PM Fiji) — catches 3:00 PM summer release fast
     - cron: '14 2 * * 1-5'
     # 2) 02:42 UTC = 3:42 PM NZDT (2:42 PM Fiji) — catches slightly late summer uploads
